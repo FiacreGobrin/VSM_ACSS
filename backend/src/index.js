@@ -1,7 +1,7 @@
 import { loadConfig } from './config/config.js'
 import { makeLogger } from './shared/logger.js'
-import { createDbPool } from './platform/db/pool.js'
-import { runMigrations } from './platform/db/migrate.js'
+import { createMongoClient } from './platform/db/mongo.js'
+import { runMongoMigrations } from './platform/db/migrateMongo.js'
 import { makeModules } from './modules/index.js'
 import { makeApp } from './app.js'
 
@@ -15,29 +15,38 @@ async function bootstrap() {
   logger.info('Environment configuration:', {
     env: config.env,
     port: config.port,
-    databaseTarget: config.isNeon ? 'Neon Serverless PostgreSQL' : 'PostgreSQL',
+    databaseTarget: config.mongo.isAtlas ? 'MongoDB Atlas' : 'MongoDB',
+    database: config.mongo.dbName,
   })
 
-  // Initialize Neon database pool
-  const db = createDbPool(config.databaseUrl, { ...config.db, logger })
+  if (!config.mongo.uri) {
+    logger.warn('MONGODB_URI is not configured. The API will start, but every request that')
+    logger.warn('touches the database will fail. Set it in backend/.env to enable data features.')
+    logger.warn('Example: mongodb+srv://user:password@cluster0.example.net/vms_acs')
+  }
 
-  // Auto-run schema migrations on startup if valid connection string is provided
-  if (config.databaseUrl && !config.databaseUrl.includes('placeholder')) {
-    try {
-      logger.info('Running database migrations check...')
-      const applied = await runMigrations(db, { logger })
-      if (applied.length > 0) {
-        logger.info(`Database schema updated: applied ${applied.length} migration(s).`)
-      } else {
-        logger.info('Database schema is up to date.')
-      }
-    } catch (err) {
-      logger.error('Startup migration check failed:', { error: err.message })
-      logger.warn('Continuing startup, but database queries may fail if schema is missing.')
+  // Connect to MongoDB. A failure here is fatal: serving a console that can
+  // never reach its data would hide the problem behind 500s at request time.
+  const { client, db } = await createMongoClient(config.mongo.uri, {
+    logger,
+    dbName: config.mongo.dbName,
+    maxPoolSize: config.db.max,
+    minPoolSize: config.db.min,
+  })
+
+  // Apply pending schema migrations at startup so a fresh deployment converges
+  // without a separate manual step.
+  try {
+    logger.info('Running database migrations check...')
+    const applied = await runMongoMigrations(db, { logger })
+    if (applied.length > 0) {
+      logger.info(`Database schema updated: applied ${applied.length} migration(s).`)
+    } else {
+      logger.info('Database schema is up to date.')
     }
-  } else {
-    logger.warn('DATABASE_URL is not configured yet with real Neon credentials.')
-    logger.warn('Update .env with your Neon connection string to enable database features.')
+  } catch (err) {
+    logger.error('Startup migration check failed:', { error: err.message })
+    logger.warn('Continuing startup, but database queries may fail if schema is missing.')
   }
 
   // Assemble modules & Express app
@@ -61,10 +70,10 @@ async function bootstrap() {
     server.close(async () => {
       logger.info('HTTP server closed.')
       try {
-        await db.end()
-        logger.info('Database connections closed.')
+        await client.close()
+        logger.info('MongoDB connections closed.')
       } catch (err) {
-        logger.error('Error closing database pool:', { error: err.message })
+        logger.error('Error closing the MongoDB client:', { error: err.message })
       }
       process.exit(0)
     })

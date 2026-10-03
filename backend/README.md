@@ -1,6 +1,8 @@
 # CCTV Visitor Management & Access Authorization Backend
 
-A production-grade, modular backend built with **Node.js (ESM)**, **Express 5**, and **Neon Serverless PostgreSQL**. Designed specifically for high-security facilities requiring **visitor registration, access passes, role-based authorization, and real-time CCTV camera facial identification & security alerting**.
+A production-grade, modular backend built with **Node.js (ESM)**, **Express 5**, and **MongoDB**. Designed specifically for high-security facilities requiring **visitor registration, access passes, role-based authorization, and real-time CCTV camera facial identification & security alerting**.
+
+> **Storage engine: MongoDB.** The API speaks the official `mongodb` driver and targets either **MongoDB Atlas** (`mongodb+srv://`) or a self-hosted **mongod** (`mongodb://`), so the air-gapped appliance and a hosted cluster use the same code.
 
 ---
 
@@ -9,34 +11,39 @@ A production-grade, modular backend built with **Node.js (ESM)**, **Express 5**,
 ```text
 c:\Users\Fiacre\Desktop\backend/
 ├── .env.example              # Environment variables template
-├── .env                      # Local environment configuration (Neon connection)
+├── .env                      # Local environment configuration (MONGODB_URI)
 ├── .gitignore
 ├── package.json              # NPM scripts and dependencies
 ├── README.md                 # Complete documentation & API reference
 ├── migrations/
-│   ├── 0001_initial_schema.up.sql    # Full schema DDL for Neon PostgreSQL
-│   └── 0001_initial_schema.down.sql  # Safe schema rollback
+│   └── mongo/                # Numbered schema migrations (JS, not SQL)
+│       ├── _helpers.js            # defineCollection / schema / index helpers
+│       ├── 0001_initial_schema.js
+│       ├── 0002_user_profiles_and_dashboard.js
+│       └── 0003_recordings_and_media_upload.js
 └── src/
     ├── index.js              # Server entry point & graceful shutdown
     ├── app.js                # Express 5 application setup & middleware pipeline
     ├── config/
     │   ├── env.js            # Zero-dependency .env loader
-    │   └── config.js         # Config validation & Neon SSL auto-tuning
+    │   └── config.js         # Config validation & MONGODB_URI parsing
     ├── platform/
     │   ├── db/
-    │   │   ├── pool.js       # Neon-resilient pg.Pool with SSL handling
-    │   │   └── migrate.js    # Built-in migration runner with schema_migrations
+    │   │   ├── mongo.js      # MongoClient factory, ping, server info
+    │   │   └── migrateMongo.js # Migration runner + schema_migrations collection
     │   └── storage/
     │       └── localDiskStorage.js # Filesystem blob storage for uploaded evidence
     ├── shared/
     │   ├── errors.js         # AppError hierarchy (BadRequest, Unauthorized, etc.)
     │   ├── logger.js         # Structured JSON/console logger
     │   ├── http/respond.js   # Standardized success/error JSON response envelopes
+    │   ├── mongo/
+    │   │   └── helpers.js    # Regex escaping, UUID ids, paging, projections
     │   ├── media/
     │   │   └── magicBytes.js # Content-type verification for uploaded media
     │   └── middleware/
     │       ├── auth.js       # JWT authentication & Role-Based Access Control (RBAC)
-    │       ├── errorHandler.js # Centralized Postgres & App error translation
+    │       ├── errorHandler.js # MongoDB error translation (11000, 121, 26)
     │       └── requestLogger.js# Request latency & HTTP status logger
     ├── modules/
     │   ├── health/           # GET /health — Database ping & uptime status
@@ -55,46 +62,55 @@ c:\Users\Fiacre\Desktop\backend/
 
 ---
 
-## ⚡ Quick Start: Connecting to Neon Database
+## Quick Start: Connecting to MongoDB
 
-### Step 1: Create a Database on Neon
-1. Log into your [Neon Console](https://console.neon.tech/).
-2. Click **Create Project** (e.g. `cctv-visitor-backend`).
-3. Under the **Connection Details** dashboard card:
-   - Select **Direct Connection** (recommended for backend services & migrations).
-   - Ensure `sslmode=require` is present in the URI.
-   - Copy the connection URI:
-     ```text
-     postgresql://[user]:[password]@[endpoint].neon.tech/[dbname]?sslmode=require
-     ```
+### Step 1: Create a Database
+
+**Option A - MongoDB Atlas (hosted)**
+1. Log into [MongoDB Atlas](https://cloud.mongodb.com/) and create a free **M0** cluster.
+2. Under **Database Access**, create a user *with a role on the target database*.
+   Adding a user without granting a role is the most common cause of "not
+   authorized" on Atlas.
+3. Under **Network Access**, allow your client IP (or `0.0.0.0/0` while testing).
+4. Click **Connect -> Drivers** and copy the connection string.
+
+**Option B - Self-hosted (recommended for an air-gapped appliance)**
+```bash
+docker run -d --name vms-mongo -p 27017:27017 -v vms-mongo-data:/data/db mongo:8
+```
 
 ### Step 2: Configure your `.env` File
-Open `.env` and set `DATABASE_URL`:
 ```env
 PORT=8080
 NODE_ENV=development
-DATABASE_URL=postgresql://[user]:[password]@[endpoint].neon.tech/[dbname]?sslmode=require
+MONGODB_URI=mongodb+srv://user:password@cluster0.example.net/vms_acs?appName=Cluster0
+MONGODB_DB=vms_acs
 JWT_SECRET=your_jwt_secret_change_in_production
 ```
 
+> **Percent-encode credentials.** A username containing `@` (an email address)
+> must be written as `%40`, otherwise the driver cannot distinguish the
+> credentials from the hostname and the connection fails.
+
 ### Step 3: Run Connection Diagnostics
-Run the built-in diagnostic tool to test network reachability, TLS handshake, and check Neon tables:
+Verifies reachability, TLS, authentication, collections, applied migrations,
+record counts and index coverage, with hints for common misconfigurations:
 ```powershell
 npm.cmd run db:check
 ```
 
 ### Step 4: Run Database Migrations
-Create all necessary tables (`users`, `zones`, `visitors`, `visits`, `cameras`, `identifications`, `security_alerts`, `audit_logs`, `recordings`) in your Neon database:
+Creates the ten collections with their JSON Schema validators and indexes:
 ```powershell
 npm.cmd run migrate
 ```
 
 ### Step 5: (Optional) Seed Sample Data
-Populate default administrator users, zones, cameras, and sample visitor profiles:
+Populate operators, zones, cameras, visitors, live visits, a detection and an alert:
 ```powershell
 npm.cmd run db:seed
 ```
-*Default seeded admin credentials: `username: admin`, `password: AdminPass123!`*
+*Seeded credentials: `admin` / `AdminPass123!`, `guard_john` / `GuardPass123!`, `auditor_mugisha` / `AuditorPass123!`*
 
 ### Step 6: Start the Backend Server
 ```powershell
@@ -110,7 +126,7 @@ The server will start listening at `http://localhost:8080`.
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | API Information and root endpoint directory |
-| `GET` | `/health` | Server uptime and Neon PostgreSQL connection latency check |
+| `GET` | `/health` | Server uptime and MongoDB connection latency check |
 
 ### 2. Authentication & Authorization (RBAC)
 | Method | Endpoint | Auth | Description |
@@ -163,10 +179,10 @@ Every upload and purge writes an `audit_logs` entry (`UPLOAD_RECORDING` /
 
 **Storage.** Clips are written to the local volume at `UPLOAD_DIR` (default
 `backend/uploads`, git-ignored) under a generated
-`recordings/<year>/<month>/<uuid>.<ext>` key. Postgres holds only the registry
+`recordings/<year>/<month>/<uuid>.<ext>` key. MongoDB holds only the registry
 index, never the bytes — a large clip would otherwise bloat every backup and
-row-level dump. Swap `platform/storage/localDiskStorage.js` for an
-S3-compatible adapter if a sanctioned egress path is ever introduced.
+`mongodump`. Swap `platform/storage/localDiskStorage.js` for an
+S3-compatible adapter if a sanctioned egress path is introduced.
 
 **Verification.** A client-supplied `Content-Type` is attacker-controlled, so
 `shared/media/magicBytes.js` re-derives the type from the file's leading bytes

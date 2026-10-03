@@ -1,6 +1,36 @@
 import { BadRequestError, NotFoundError } from '../../shared/errors.js'
+import { COLLECTIONS, newId, paging, safeLimit, present, toDate } from '../../shared/mongo/helpers.js'
 
+/**
+ * Visit passes: scheduling, check-in and check-out.
+ *
+ * `listVisits` previously joined `visits` to `visitors` to denormalise the
+ * visitor's name and ID document onto each row for the visitor desk table. That
+ * is a `$lookup` here, which preserves the single-round-trip property.
+ */
 export function makeVisitsService({ db }) {
+  const visits = db.collection(COLLECTIONS.visits)
+  const visitors = db.collection(COLLECTIONS.visitors)
+  const auditLogs = db.collection(COLLECTIONS.auditLogs)
+
+  const audit = async (actorId, action, entityId, details) => {
+    if (!actorId) return
+    try {
+      await auditLogs.insertOne({
+        id: newId(),
+        user_id: actorId,
+        action,
+        entity_type: 'visit',
+        entity_id: entityId,
+        ip_address: null,
+        details,
+        created_at: new Date(),
+      })
+    } catch (err) {
+      console.warn('[Audit] Failed to record visit audit event:', err.message)
+    }
+  }
+
   return {
     async createVisit(data, actorId = null) {
       const {
@@ -17,60 +47,73 @@ export function makeVisitsService({ db }) {
         throw new BadRequestError('visitorId, hostName, and purpose are required')
       }
 
-      // Check visitor status
-      const visitorRes = await db.query('SELECT id, status, full_name FROM visitors WHERE id = $1', [visitorId])
-      if (visitorRes.rows.length === 0) {
+      // Stands in for the `visits.visitor_id REFERENCES visitors(id)` constraint.
+      const visitor = await visitors.findOne(
+        { id: visitorId },
+        { projection: { _id: 0, id: 1, status: 1, full_name: 1 } }
+      )
+      if (!visitor) {
         throw new NotFoundError('Visitor not found')
       }
 
-      const visitor = visitorRes.rows[0]
       if (visitor.status === 'blacklisted') {
         throw new BadRequestError('Cannot schedule visit: This visitor is blacklisted.')
       }
 
-      const result = await db.query(
-        `INSERT INTO visits (
-          visitor_id, host_name, host_email, purpose, badge_number, authorized_zones, expected_arrival, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'scheduled')
-        RETURNING *`,
-        [
-          visitorId,
-          hostName.trim(),
-          hostEmail ? hostEmail.trim() : null,
-          purpose.trim(),
-          badgeNumber,
-          JSON.stringify(authorizedZones),
-          expectedArrival,
-        ]
-      )
-
-      const visit = result.rows[0]
-
-      if (actorId) {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, 'CREATE_VISIT', 'visit', $2, $3)`,
-          [actorId, visit.id, JSON.stringify({ visitorId, hostName, purpose })]
-        )
+      const now = new Date()
+      const doc = {
+        id: newId(),
+        visitor_id: visitorId,
+        host_name: hostName.trim(),
+        host_email: hostEmail ? hostEmail.trim() : null,
+        purpose: purpose.trim(),
+        badge_number: badgeNumber,
+        status: 'scheduled',
+        check_in_at: null,
+        check_out_at: null,
+        expected_arrival: toDate(expectedArrival) || now,
+        authorized_zones: Array.isArray(authorizedZones) ? authorizedZones : [],
+        on_site: false,
+        created_at: now,
+        updated_at: now,
       }
 
-      return visit
+      await visits.insertOne(doc)
+
+      await audit(actorId, 'CREATE_VISIT', doc.id, { visitorId, hostName, purpose })
+
+      return present(doc)
     },
 
     async checkIn(visitId, { badgeNumber = null } = {}, actorId = null) {
-      const visitRes = await db.query(
-        `SELECT v.*, vis.status as visitor_status, vis.full_name as visitor_name
-         FROM visits v
-         JOIN visitors vis ON v.visitor_id = vis.id
-         WHERE v.id = $1`,
-        [visitId]
-      )
+      // `JOIN visitors vis ON v.visitor_id = vis.id` -> $lookup.
+      const rows = await visits
+        .aggregate([
+          { $match: { id: visitId } },
+          {
+            $lookup: {
+              from: COLLECTIONS.visitors,
+              localField: 'visitor_id',
+              foreignField: 'id',
+              as: '_visitor',
+            },
+          },
+          { $addFields: { _visitor: { $arrayElemAt: ['$_visitor', 0] } } },
+          {
+            $addFields: {
+              visitor_status: '$_visitor.status',
+              visitor_name: '$_visitor.full_name',
+            },
+          },
+          { $project: { _visitor: 0 } },
+        ])
+        .toArray()
 
-      if (visitRes.rows.length === 0) {
+      if (rows.length === 0) {
         throw new NotFoundError(`Visit ${visitId} not found`)
       }
 
-      const visit = visitRes.rows[0]
+      const visit = rows[0]
       if (visit.visitor_status === 'blacklisted') {
         throw new BadRequestError('Check-in denied: Visitor is blacklisted.')
       }
@@ -80,98 +123,93 @@ export function makeVisitsService({ db }) {
       }
 
       const finalBadge = badgeNumber || visit.badge_number
+      const now = new Date()
 
-      const result = await db.query(
-        `UPDATE visits
-         SET status = 'checked_in', check_in_at = now(), badge_number = $1, on_site = true, updated_at = now()
-         WHERE id = $2
-         RETURNING *`,
-        [finalBadge, visitId]
+      const updated = await visits.findOneAndUpdate(
+        { id: visitId },
+        {
+          $set: {
+            status: 'checked_in',
+            check_in_at: now,
+            badge_number: finalBadge,
+            on_site: true,
+            updated_at: now,
+          },
+        },
+        { returnDocument: 'after' }
       )
 
-      if (actorId) {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, 'VISITOR_CHECK_IN', 'visit', $2, $3)`,
-          [actorId, visitId, JSON.stringify({ badgeNumber: finalBadge, visitorName: visit.visitor_name })]
-        )
-      }
+      await audit(actorId, 'VISITOR_CHECK_IN', visitId, {
+        badgeNumber: finalBadge,
+        visitorName: visit.visitor_name,
+      })
 
-      return result.rows[0]
+      return present(updated)
     },
-
-    async checkOut(visitId, actorId = null) {
-      const visitRes = await db.query('SELECT * FROM visits WHERE id = $1', [visitId])
-      if (visitRes.rows.length === 0) {
+async checkOut(visitId, actorId = null) {
+      const visit = await visits.findOne({ id: visitId })
+      if (!visit) {
         throw new NotFoundError(`Visit ${visitId} not found`)
       }
 
-      const visit = visitRes.rows[0]
       if (visit.status !== 'checked_in') {
         throw new BadRequestError(`Cannot check out: visit status is currently '${visit.status}'.`)
       }
 
-      const result = await db.query(
-        `UPDATE visits
-         SET status = 'checked_out', check_out_at = now(), on_site = false, updated_at = now()
-         WHERE id = $1
-         RETURNING *`,
-        [visitId]
+      const now = new Date()
+      const updated = await visits.findOneAndUpdate(
+        { id: visitId },
+        { $set: { status: 'checked_out', check_out_at: now, on_site: false, updated_at: now } },
+        { returnDocument: 'after' }
       )
 
-      if (actorId) {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, 'VISITOR_CHECK_OUT', 'visit', $2, $3)`,
-          [actorId, visitId, JSON.stringify({ checkOutAt: new Date().toISOString() })]
-        )
-      }
+      await audit(actorId, 'VISITOR_CHECK_OUT', visitId, { checkOutAt: now.toISOString() })
 
-      return result.rows[0]
+      return present(updated)
     },
 
     async listVisits({ status = '', visitorId = '', limit = 50, offset = 0 } = {}) {
-      const conditions = []
-      const params = []
+      const filter = {}
+      if (status) filter.status = status
+      if (visitorId) filter.visitor_id = visitorId
 
-      if (status) {
-        params.push(status)
-        conditions.push(`v.status = $${params.length}`)
-      }
+      const total = await visits.countDocuments(filter)
 
-      if (visitorId) {
-        params.push(visitorId)
-        conditions.push(`v.visitor_id = $${params.length}`)
-      }
+      const { skip, limit: take } = paging(safeLimit(limit), offset)
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-
-      const countSql = `SELECT count(*)::int as total FROM visits v ${whereClause}`
-      const totalRes = await db.query(countSql, params)
-      const total = totalRes.rows[0].total
-
-      params.push(limit)
-      const limitIdx = params.length
-      params.push(offset)
-      const offsetIdx = params.length
-
-      const dataSql = `
-        SELECT
-          v.id, v.visitor_id, v.host_name, v.host_email, v.purpose, v.badge_number,
-          v.status, v.check_in_at, v.check_out_at, v.expected_arrival, v.authorized_zones,
-          v.on_site, v.created_at, v.updated_at,
-          vis.full_name as visitor_name, vis.id_type, vis.id_number, vis.company, vis.photo_url
-        FROM visits v
-        JOIN visitors vis ON v.visitor_id = vis.id
-        ${whereClause}
-        ORDER BY v.created_at DESC
-        LIMIT $${limitIdx} OFFSET $${offsetIdx}
-      `
-      const dataRes = await db.query(dataSql, params)
+      const rows = await visits
+        .aggregate([
+          { $match: filter },
+          {
+            $lookup: {
+              from: COLLECTIONS.visitors,
+              localField: 'visitor_id',
+              foreignField: 'id',
+              as: '_visitor',
+            },
+          },
+          { $addFields: { _visitor: { $arrayElemAt: ['$_visitor', 0] } } },
+          {
+            // Flattens the joined document into the row, exactly as the old
+            // `vis.full_name as visitor_name, ...` aliases did.
+            $addFields: {
+              visitor_name: '$_visitor.full_name',
+              id_type: '$_visitor.id_type',
+              id_number: '$_visitor.id_number',
+              company: '$_visitor.company',
+              photo_url: '$_visitor.photo_url',
+            },
+          },
+          { $project: { _visitor: 0 } },
+          { $sort: { created_at: -1 } },
+          { $skip: skip },
+          { $limit: take },
+        ])
+        .toArray()
 
       return {
-        items: dataRes.rows,
-        pagination: { total, limit, offset },
+        items: rows.map(present),
+        pagination: { total, limit: take, offset: skip },
       }
     },
   }

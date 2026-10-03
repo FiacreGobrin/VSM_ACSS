@@ -1,46 +1,62 @@
 import { sendSuccess } from '../../shared/http/respond.js'
+import { COLLECTIONS, paging, safeLimit, present } from '../../shared/mongo/helpers.js'
 
+/**
+ * Compliance audit trail.
+ *
+ * Was previously a controller with inline SQL; the MongoDB version uses a
+ * `$lookup` onto `users` to denormalise the operator's username and full name
+ * onto each row, matching the old `LEFT JOIN users u` aliases.
+ */
 export function makeAuditController({ db }) {
+  const auditLogs = db.collection(COLLECTIONS.auditLogs)
+
   return {
     async list(req, res, next) {
       try {
-        const { action, entityType, limit = 50, offset = 0 } = req.query
-        const conditions = []
-        const params = []
+        const { action, entityType, limit = 50, offset = 0 } = req.query;
 
-        if (action) {
-          params.push(action)
-          conditions.push(`a.action = $${params.length}`)
-        }
-        if (entityType) {
-          params.push(entityType)
-          conditions.push(`a.entity_type = $${params.length}`)
-        }
+        const filter = {};
+        if (action) filter.action = action;
+        if (entityType) filter.entity_type = entityType;
 
-        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+        const total = await auditLogs.countDocuments(filter);
 
-        const countRes = await db.query(`SELECT count(*)::int as total FROM audit_logs a ${whereClause}`, params)
-        const total = countRes.rows[0].total
+        const { skip, limit: take } = paging(safeLimit(limit), offset);
 
-        params.push(parseInt(limit, 10))
-        const limitIdx = params.length
-        params.push(parseInt(offset, 10))
-        const offsetIdx = params.length
+        const rows = await auditLogs
+          .aggregate([
+            { $match: filter },
+            {
+              $lookup: {
+                from: COLLECTIONS.users,
+                localField: 'user_id',
+                foreignField: 'id',
+                as: '_user',
+              },
+            },
+            { $addFields: { _user: { $arrayElemAt: ['$_user', 0] } } },
+            {
+              $addFields: {
+                user_username: '$_user.username',
+                user_full_name: '$_user.full_name',
+              },
+            },
+            { $project: { _user: 0 } },
+            { $sort: { created_at: -1 } },
+            { $skip: skip },
+            { $limit: take },
+          ])
+          .toArray();
 
-        const dataSql = `
-          SELECT a.*, u.username as user_username, u.full_name as user_full_name
-          FROM audit_logs a
-          LEFT JOIN users u ON a.user_id = u.id
-          ${whereClause}
-          ORDER BY a.created_at DESC
-          LIMIT $${limitIdx} OFFSET $${offsetIdx}
-        `
-        const dataRes = await db.query(dataSql, params)
-
-        sendSuccess(res, dataRes.rows, { total, limit: parseInt(limit, 10), offset: parseInt(offset, 10) })
+        sendSuccess(
+          res,
+          rows.map(present),
+          { total, limit: take, offset: skip }
+        );
       } catch (err) {
-        next(err)
+        next(err);
       }
     },
-  }
+  };
 }

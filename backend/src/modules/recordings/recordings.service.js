@@ -1,107 +1,158 @@
 import { BadRequestError, NotFoundError, AppError } from '../../shared/errors.js'
 import { detectMediaType, assertMediaTypeAllowed } from '../../shared/media/magicBytes.js'
+import { COLLECTIONS, newId, paging, safeLimit, present, toDate } from '../../shared/mongo/helpers.js'
 
 /**
  * Evidence library for uploaded CCTV footage.
  *
  * Uploads are buffered in memory by multer (see `recordings.routes.js`) so the
- * magic bytes can be verified *before* anything is written to disk. That is the
- * whole reason for the buffering approach: a stream straight to the filesystem
- * would have to be un-linked after the fact if the content turned out to be a
- * renamed executable.
+ * magic bytes can be verified *before* anything is written to disk.
+ *
+ * Referential note: the Postgres version relied on
+ * `recordings.camera_id REFERENCES cameras(id) ON DELETE SET NULL`. MongoDB does
+ * not enforce foreign keys or cascades, so a camera deletion would leave
+ * dangling `camera_id` values in this collection. Deleting a camera is not
+ * exposed by the API today, and `ON DELETE SET NULL` semantics are preserved for
+ * the fields the service does manage (it nulls `cameras.last_recording_id`).
+ * If camera deletion is added later, it must explicitly clear these references.
  */
 export function makeRecordingsService({ db, config, storage, logger }) {
   const uploads = config.uploads
+  const recordings = db.collection(COLLECTIONS.recordings)
+  const cameras = db.collection(COLLECTIONS.cameras)
+  const auditLogs = db.collection(COLLECTIONS.auditLogs)
 
-  /**
-   * Columns safe to expose. `storage_path` is deliberately absent: it reveals
-   * the on-disk layout to any operator and has no business in a list response.
-   */
-  const PUBLIC_COLUMNS = `
-    r.id, r.camera_id, r.zone_id, r.identification_id, r.uploaded_by,
-    r.title, r.description, r.media_kind, r.content_type, r.size_bytes,
-    r.original_filename, r.recorded_at, r.retention_until, r.created_at, r.updated_at
-  `
+  /** Columns safe to expose. `storage_path` is deliberately absent. */
+  const PUBLIC_PROJECTION = {
+    _id: 0,
+    id: 1,
+    camera_id: 1,
+    zone_id: 1,
+    identification_id: 1,
+    uploaded_by: 1,
+    title: 1,
+    description: 1,
+    media_kind: 1,
+    content_type: 1,
+    size_bytes: 1,
+    original_filename: 1,
+    recorded_at: 1,
+    retention_until: 1,
+    created_at: 1,
+    updated_at: 1,
+  }
 
   return {
     async listRecordings({ cameraId = '', zoneId = '', mediaKind = '', limit = 50, offset = 0 } = {}) {
-      const conditions = []
-      const params = []
+      const filter = {}
 
-      if (cameraId) {
-        params.push(cameraId)
-        conditions.push(`r.camera_id = $${params.length}`)
-      }
-
-      if (zoneId) {
-        params.push(zoneId)
-        conditions.push(`r.zone_id = $${params.length}`)
-      }
+      if (cameraId) filter.camera_id = cameraId
+      if (zoneId) filter.zone_id = zoneId
 
       if (mediaKind) {
         if (!['video', 'image'].includes(mediaKind)) {
           throw new BadRequestError(`Invalid mediaKind "${mediaKind}". Must be "video" or "image".`)
         }
-        params.push(mediaKind)
-        conditions.push(`r.media_kind = $${params.length}`)
+        filter.media_kind = mediaKind
       }
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const total = await recordings.countDocuments(filter)
 
-      const totalRes = await db.query(
-        `SELECT count(*)::int as total FROM recordings r ${whereClause}`,
-        params
-      )
+      const { skip, limit: take } = paging(safeLimit(limit), offset)
 
-      params.push(limit)
-      const limitIndex = params.length
-      params.push(offset)
-      const offsetIndex = params.length
-
-      const dataRes = await db.query(
-        `SELECT ${PUBLIC_COLUMNS},
-                c.name as camera_name,
-                z.name as zone_name,
-                u.username as uploaded_by_username
-         FROM recordings r
-         LEFT JOIN cameras c ON r.camera_id = c.id
-         LEFT JOIN zones   z ON r.zone_id = z.id
-         LEFT JOIN users   u ON r.uploaded_by = u.id
-         ${whereClause}
-         ORDER BY r.recorded_at DESC, r.created_at DESC
-         LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
-        params
-      )
+      const rows = await recordings
+        .aggregate([
+          { $match: filter },
+          {
+            $lookup: {
+              from: COLLECTIONS.cameras,
+              localField: 'camera_id',
+              foreignField: 'id',
+              as: '_camera',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.zones,
+              localField: 'zone_id',
+              foreignField: 'id',
+              as: '_zone',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.users,
+              localField: 'uploaded_by',
+              foreignField: 'id',
+              as: '_user',
+            },
+          },
+          {
+            $addFields: {
+              camera_name: { $arrayElemAt: ['$_camera.name', 0] },
+              zone_name: { $arrayElemAt: ['$_zone.name', 0] },
+              uploaded_by_username: { $arrayElemAt: ['$_user.username', 0] },
+            },
+          },
+          { $project: { _camera: 0, _zone: 0, _user: 0 } },
+          { $sort: { recorded_at: -1, created_at: -1 } },
+          { $skip: skip },
+          { $limit: take },
+        ])
+        .toArray()
 
       return {
-        items: dataRes.rows,
-        pagination: { total: totalRes.rows[0].total, limit, offset },
+        items: rows.map(present),
+        pagination: { total, limit: take, offset: skip },
       }
     },
 
     async getRecordingById(id) {
-      const result = await db.query(
-        `SELECT ${PUBLIC_COLUMNS},
-                r.storage_path,
-                c.name as camera_name,
-                z.name as zone_name,
-                u.username as uploaded_by_username
-         FROM recordings r
-         LEFT JOIN cameras c ON r.camera_id = c.id
-         LEFT JOIN zones   z ON r.zone_id = z.id
-         LEFT JOIN users   u ON r.uploaded_by = u.id
-         WHERE r.id = $1`,
-        [id]
-      )
+      const rows = await recordings
+        .aggregate([
+          { $match: { id } },
+          {
+            $lookup: {
+              from: COLLECTIONS.cameras,
+              localField: 'camera_id',
+              foreignField: 'id',
+              as: '_camera',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.zones,
+              localField: 'zone_id',
+              foreignField: 'id',
+              as: '_zone',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.users,
+              localField: 'uploaded_by',
+              foreignField: 'id',
+              as: '_user',
+            },
+          },
+          {
+            $addFields: {
+              camera_name: { $arrayElemAt: ['$_camera.name', 0] },
+              zone_name: { $arrayElemAt: ['$_zone.name', 0] },
+              uploaded_by_username: { $arrayElemAt: ['$_user.username', 0] },
+            },
+          },
+          { $project: { _camera: 0, _zone: 0, _user: 0 } },
+        ])
+        .toArray()
 
-      if (result.rows.length === 0) {
+      if (rows.length === 0) {
         throw new NotFoundError(`Recording with ID ${id} not found`)
       }
 
-      return result.rows[0]
+      return present(rows[0])
     },
-
-    /**
+/**
      * Validates and persists one uploaded media file.
      *
      * Order matters: the buffer is classified by magic bytes first, and only a
@@ -162,8 +213,9 @@ export function makeRecordingsService({ db, config, storage, logger }) {
         )
       }
 
-      // An explicit camera must exist before the row references it, otherwise the
-      // operator gets an opaque FK violation from deep inside the driver.
+      // MongoDB does not enforce foreign keys, so this explicit check replaces
+      // the former `REFERENCES cameras(id)` constraint. Without it a typo would
+      // silently orphan the evidence.
       if (cameraId) {
         await this.assertCameraExists(cameraId)
       }
@@ -175,73 +227,74 @@ export function makeRecordingsService({ db, config, storage, logger }) {
       })
 
       try {
-        const retentionUntil = retentionDays
-          ? new Date(Date.now() + parseInt(retentionDays, 10) * 86_400_000).toISOString()
-          : null
+        const now = new Date()
+        const doc = {
+          id: newId(),
+          camera_id: cameraId || null,
+          zone_id: zoneId || null,
+          identification_id: identificationId || null,
+          uploaded_by: actorId || null,
+          title: title.trim(),
+          description: String(description).trim(),
+          media_kind: detected.mediaKind,
+          content_type: detected.mimeType,
+          size_bytes: stored.sizeBytes,
+          duration_seconds: null,
+          storage_path: stored.storedPath,
+          // Operator-supplied: retained for display only, never used as a path.
+          original_filename: String(file.originalname || 'recording').slice(0, 255),
+          recorded_at: toDate(recordedAt) || now,
+          sha256: stored.sha256,
+          retention_until: retentionDays
+            ? new Date(Date.now() + parseInt(retentionDays, 10) * 86_400_000)
+            : null,
+          created_at: now,
+          updated_at: now,
+        }
 
-        const result = await db.query(
-          `INSERT INTO recordings (
-             camera_id, zone_id, identification_id, uploaded_by,
-             title, description, media_kind, content_type, size_bytes,
-             storage_path, original_filename, recorded_at, sha256, retention_until
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                     COALESCE($12::timestamptz, now()), $13, $14)
-           RETURNING id, title, media_kind, content_type, size_bytes, recorded_at`,
-          [
-            cameraId || null,
-            zoneId || null,
-            identificationId || null,
-            actorId || null,
-            title.trim(),
-            String(description).trim(),
-            detected.mediaKind,
-            detected.mimeType,
-            stored.sizeBytes,
-            stored.storedPath,
-            // Operator-supplied: retained for display only, never used as a path.
-            String(file.originalname || 'recording').slice(0, 255),
-            recordedAt || null,
-            stored.sha256,
-            retentionUntil,
-          ]
-        )
-
-        const recording = result.rows[0]
-
-        // Keep the camera's evidence back-reference pointing at its newest clip.
+        await recordings.insertOne(doc)
+// Keep the camera's evidence back-reference pointing at its newest clip.
         if (cameraId) {
-          await db.query(
-            'UPDATE cameras SET last_recording_id = $1, updated_at = now() WHERE id = $2',
-            [recording.id, cameraId]
+          await cameras.updateOne(
+            { id: cameraId },
+            { $set: { last_recording_id: doc.id, updated_at: now } }
           )
         }
 
         if (actorId) {
-          await db.query(
-            `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-             VALUES ($1, 'UPLOAD_RECORDING', 'recording', $2, $3)`,
-            [
-              actorId,
-              recording.id,
-              JSON.stringify({
-                title: recording.title,
-                mediaKind: recording.media_kind,
-                sizeBytes: stored.sizeBytes,
-                cameraId: cameraId || null,
-                declaredType: file.mimetype || null,
-                detectedType: detected.mimeType,
-              }),
-            ]
-          )
+          await auditLogs.insertOne({
+            id: newId(),
+            user_id: actorId,
+            action: 'UPLOAD_RECORDING',
+            entity_type: 'recording',
+            entity_id: doc.id,
+            ip_address: null,
+            details: {
+              title: doc.title,
+              mediaKind: doc.media_kind,
+              sizeBytes: doc.size_bytes,
+              cameraId: cameraId || null,
+              declaredType: file.mimetype || null,
+              detectedType: detected.mimeType,
+            },
+            created_at: now,
+          })
         }
 
         logger?.info('Recording uploaded', {
-          id: recording.id,
-          bytes: stored.sizeBytes,
+          id: doc.id,
+          bytes: doc.size_bytes,
           kind: detected.mediaKind,
         })
 
-        return recording
+        return present({
+          id: doc.id,
+          title: doc.title,
+          media_kind: doc.media_kind,
+          content_type: doc.content_type,
+          size_bytes: doc.size_bytes,
+          recorded_at: doc.recorded_at,
+        })
       } catch (err) {
         // The row was not persisted, so the object on disk is unreachable
         // garbage. Remove it, otherwise a DB hiccup leaks disk space that
@@ -255,7 +308,7 @@ export function makeRecordingsService({ db, config, storage, logger }) {
     async deleteRecording(id, actorId = null) {
       const recording = await this.getRecordingById(id)
 
-      await db.query('DELETE FROM recordings WHERE id = $1', [id])
+      await recordings.deleteOne({ id })
 
       // The row is authoritative for the object's location, so it is deleted
       // first: a failure below then leaves a missing file (recoverable by
@@ -263,19 +316,20 @@ export function makeRecordingsService({ db, config, storage, logger }) {
       const removed = await storage.remove(recording.storage_path)
 
       if (actorId) {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, 'DELETE_RECORDING', 'recording', $2, $3)`,
-          [
-            actorId,
-            id,
-            JSON.stringify({
-              title: recording.title,
-              sizeBytes: recording.size_bytes,
-              fileRemoved: removed,
-            }),
-          ]
-        )
+        await auditLogs.insertOne({
+          id: newId(),
+          user_id: actorId,
+          action: 'DELETE_RECORDING',
+          entity_type: 'recording',
+          entity_id: id,
+          ip_address: null,
+          details: {
+            title: recording.title,
+            sizeBytes: recording.size_bytes,
+            fileRemoved: removed,
+          },
+          created_at: new Date(),
+        })
       }
 
       return { id, deleted: true, fileRemoved: removed }
@@ -283,11 +337,11 @@ export function makeRecordingsService({ db, config, storage, logger }) {
 
     /** Confirms a camera exists before evidence is attributed to it. */
     async assertCameraExists(cameraId) {
-      const result = await db.query('SELECT id FROM cameras WHERE id = $1', [cameraId])
-      if (result.rows.length === 0) {
+      const camera = await cameras.findOne({ id: cameraId }, { projection: { _id: 0, id: 1 } })
+      if (!camera) {
         throw new NotFoundError(`Camera with ID ${cameraId} not found`)
       }
-      return result.rows[0]
+      return camera
     },
   }
 }

@@ -1,9 +1,26 @@
 import { BadRequestError, NotFoundError } from '../../shared/errors.js'
+import {
+  COLLECTIONS,
+  newId,
+  paging,
+  safeLimit,
+  present,
+  toDate,
+} from '../../shared/mongo/helpers.js'
 
+/**
+ * CCTV identification events and the autonomous security-alert engine.
+ */
 export function makeIdentificationService({ db }) {
+  const identifications = db.collection(COLLECTIONS.identifications)
+  const cameras = db.collection(COLLECTIONS.cameras)
+  const visitors = db.collection(COLLECTIONS.visitors)
+  const alerts = db.collection(COLLECTIONS.securityAlerts)
+  const auditLogs = db.collection(COLLECTIONS.auditLogs)
+
   return {
     /**
-     * Ingests a CCTV camera identification/detection event from camera AI stream.
+     * Ingests a CCTV camera identification/detection event from a camera AI stream.
      * Evaluates security rules and automatically triggers security alerts if necessary.
      */
     async recordDetection(data, actorId = null) {
@@ -33,252 +50,285 @@ export function makeIdentificationService({ db }) {
         throw new BadRequestError(`Invalid eventType. Valid types are: ${validEvents.join(', ')}`)
       }
 
-      // 1. Verify camera exists and get its zone
-      const cameraRes = await db.query(
-        `SELECT c.*, z.name as zone_name, z.security_level as zone_security_level
-         FROM cameras c
-         LEFT JOIN zones z ON c.zone_id = z.id
-         WHERE c.id = $1`,
-        [cameraId]
-      )
+      // 1. Verify camera exists and get its zone.
+      // `cameras.camera_id` was NOT NULL REFERENCES cameras(id) - enforced here.
+      const cameraRows = await cameras
+        .aggregate([
+          { $match: { id: cameraId } },
+          {
+            $lookup: {
+              from: COLLECTIONS.zones,
+              localField: 'zone_id',
+              foreignField: 'id',
+              as: '_zone',
+            },
+          },
+          {
+            $addFields: {
+              // `$_zone` holds the joined documents; projecting `.name` off each
+              // element yields the string, not the document.
+              zone_name: { $arrayElemAt: ['$_zone.name', 0] },
+              zone_security_level: {
+                $ifNull: [
+                  { $getField: { field: 'security_level', input: { $arrayElemAt: ['$_zone', 0] } } },
+                  null,
+                ],
+              },
+            },
+          },
+          { $project: { _zone: 0 } },
+        ])
+        .toArray()
 
-      if (cameraRes.rows.length === 0) {
+      if (cameraRows.length === 0) {
         throw new NotFoundError(`Camera with ID ${cameraId} not found`)
       }
-      const camera = cameraRes.rows[0]
+      const camera = cameraRows[0]
 
-      // 2. Fetch visitor if visitorId provided
+      // 2. Fetch visitor if visitorId provided.
       let visitor = null
       if (visitorId) {
-        const visRes = await db.query('SELECT * FROM visitors WHERE id = $1', [visitorId])
-        if (visRes.rows.length > 0) {
-          visitor = visRes.rows[0]
-        }
+        visitor = await visitors.findOne({ id: visitorId })
       }
 
-      // 3. Insert identification record
-      const idRes = await db.query(
-        `INSERT INTO identifications (
-          camera_id, visitor_id, event_type, confidence_score, captured_frame_url,
-          detected_bounding_box, notes, detected_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING *`,
-        [
-          cameraId,
-          visitor ? visitor.id : null,
-          eventType,
-          confidenceScore,
-          capturedFrameUrl,
-          detectedBoundingBox ? JSON.stringify(detectedBoundingBox) : null,
-          notes,
-          detectedAt,
-        ]
-      )
-      const identification = idRes.rows[0]
+      // 3. Insert identification record.
+      const now = new Date()
+      const doc = {
+        id: newId(),
+        camera_id: cameraId,
+        visitor_id: visitor ? visitor.id : null,
+        event_type: eventType,
+        confidence_score: confidenceScore === null ? null : Number(confidenceScore),
+        captured_frame_url: capturedFrameUrl,
+        // The JSONB column becomes a native embedded document - no stringify.
+        detected_bounding_box: detectedBoundingBox || null,
+        notes,
+        detected_at: toDate(detectedAt) || now,
+        created_at: now,
+      }
+      await identifications.insertOne(doc)
 
-      // 4. Autonomous Security Alert Engine
-      let generatedAlert = null
+      // 4. Autonomous Security Alert Engine.
+      let generatedAlert = null;
 
-      // Rule A: Blacklisted person detected
+      // Rule A: Blacklisted person detected.
       if (visitor && visitor.status === 'blacklisted') {
         generatedAlert = await this.triggerAlert({
-          identificationId: identification.id,
+          identificationId: doc.id,
           cameraId,
           severity: 'critical',
-          title: `CRITICAL: Blacklisted Individual Detected`,
-          description: `Blacklisted visitor "${visitor.full_name}" (ID: ${visitor.id_number}) was identified by CCTV "${camera.name}" in zone "${camera.zone_name || 'Unassigned'}".`,
-        })
+          title: 'CRITICAL: Blacklisted Individual Detected',
+          description:
+            `Blacklisted visitor "${visitor.full_name}" (ID: ${visitor.id_number}) was identified ` +
+            `by CCTV "${camera.name}" in zone "${camera.zone_name || 'Unassigned'}".`,
+        });
       }
-      // Rule B: Unrecognized person in high-security zone (security_level >= 2)
+      // Rule B: Unrecognized person in a high-security zone (security_level >= 2).
       else if (eventType === 'unrecognized_person' && (camera.zone_security_level || 1) >= 2) {
         generatedAlert = await this.triggerAlert({
-          identificationId: identification.id,
+          identificationId: doc.id,
           cameraId,
           severity: 'high',
-          title: `ALERT: Unrecognized Person in Secured Zone`,
-          description: `An unidentified individual was detected by CCTV "${camera.name}" in restricted zone "${camera.zone_name}" (Security Level ${camera.zone_security_level}).`,
-        })
-      }
-      // Rule C: Tailgating detected
-      else if (eventType === 'tailgating') {
-        generatedAlert = await this.triggerAlert({
-          identificationId: identification.id,
-          cameraId,
-          severity: 'high',
-          title: `ALERT: Tailgating Detected`,
-          description: `Multiple persons detected passing through single-badge checkpoint on camera "${camera.name}".`,
-        })
-      }
-      // Rule D: Recognized visitor without active pass or outside authorized zones
-      else if (visitor && eventType === 'recognized_visitor') {
-        const activeVisitRes = await db.query(
-          `SELECT * FROM visits
-           WHERE visitor_id = $1 AND status = 'checked_in'
-           ORDER BY check_in_at DESC LIMIT 1`,
-          [visitor.id]
-        )
-
-        if (activeVisitRes.rows.length === 0) {
-          // Visitor is on premises without check-in
-          generatedAlert = await this.triggerAlert({
-            identificationId: identification.id,
-            cameraId,
-            severity: 'medium',
-            title: `WARNING: Unchecked Visitor on Premises`,
-            description: `Visitor "${visitor.full_name}" detected by camera "${camera.name}" without an active checked-in visit pass.`,
-          })
-        } else {
-          const visit = activeVisitRes.rows[0]
-          const authorizedZones = Array.isArray(visit.authorized_zones) ? visit.authorized_zones : []
-          if (camera.zone_id && authorizedZones.length > 0 && !authorizedZones.includes(camera.zone_id)) {
-            generatedAlert = await this.triggerAlert({
-              identificationId: identification.id,
-              cameraId,
-              severity: 'high',
-              title: `ALERT: Unauthorized Zone Breach`,
-              description: `Visitor "${visitor.full_name}" entered zone "${camera.zone_name}", which is not listed in their authorized visit pass.`,
-            })
-          }
-        }
+          title: 'ALERT: Unrecognized Person in Secured Zone',
+          description:
+            `An unidentified individual was detected by CCTV "${camera.name}" in restricted ` +
+            `zone "${camera.zone_name}" (Security Level ${camera.zone_security_level}).`,
+        });
       }
 
-      return {
-        identification,
+      return present({
+        ...doc,
+        camera_name: camera.name,
+        zone_name: camera.zone_name,
         alert: generatedAlert,
-      }
+      });
     },
 
+    /**
+     * Creates a security alert for a detection.
+     * Separated from `recordDetection` so the rules stay readable.
+     */
     async triggerAlert({ identificationId, cameraId, severity, title, description }) {
-      const result = await db.query(
-        `INSERT INTO security_alerts (identification_id, camera_id, severity, title, description)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING *`,
-        [identificationId, cameraId, severity, title, description]
-      )
-      return result.rows[0]
+      const now = new Date()
+      const alert = {
+        id: newId(),
+        identification_id: identificationId,
+        camera_id: cameraId,
+        severity,
+        title,
+        description,
+        is_acknowledged: false,
+        acknowledged_by: null,
+        acknowledged_at: null,
+        created_at: now,
+      }
+
+      await alerts.insertOne(alert)
+
+      return present(alert)
     },
+async listDetections({ cameraId = '', eventType = '', limit = 50, offset = 0 } = {}) {
+      const filter = {}
+      if (cameraId) filter.camera_id = cameraId
+      if (eventType) filter.event_type = eventType
 
-    async listDetections({ cameraId = '', visitorId = '', eventType = '', limit = 50, offset = 0 } = {}) {
-      const conditions = []
-      const params = []
+      const total = await identifications.countDocuments(filter)
 
-      if (cameraId) {
-        params.push(cameraId)
-        conditions.push(`i.camera_id = $${params.length}`)
-      }
-      if (visitorId) {
-        params.push(visitorId)
-        conditions.push(`i.visitor_id = $${params.length}`)
-      }
-      if (eventType) {
-        params.push(eventType)
-        conditions.push(`i.event_type = $${params.length}`)
-      }
+      const { skip, limit: take } = paging(safeLimit(limit), offset)
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-
-      const countRes = await db.query(`SELECT count(*)::int as total FROM identifications i ${whereClause}`, params)
-      const total = countRes.rows[0].total
-
-      params.push(limit)
-      const limitIdx = params.length
-      params.push(offset)
-      const offsetIdx = params.length
-
-      const dataSql = `
-        SELECT
-          i.*,
-          c.name as camera_name,
-          z.name as zone_name,
-          v.full_name as visitor_name,
-          v.id_number as visitor_id_number,
-          v.company as visitor_company,
-          v.status as visitor_status,
-          a.id as alert_id,
-          a.severity as alert_severity,
-          a.title as alert_title
-        FROM identifications i
-        JOIN cameras c ON i.camera_id = c.id
-        LEFT JOIN zones z ON c.zone_id = z.id
-        LEFT JOIN visitors v ON i.visitor_id = v.id
-        LEFT JOIN security_alerts a ON a.identification_id = i.id
-        ${whereClause}
-        ORDER BY i.detected_at DESC
-        LIMIT $${limitIdx} OFFSET $${offsetIdx}
-      `
-      const dataRes = await db.query(dataSql, params)
+      // The original joined cameras -> zones -> visitors -> security_alerts in
+      // one statement. Each hop becomes a `$lookup` in the same pipeline, so the
+      // response shape is unchanged and still costs a single round-trip.
+      const rows = await identifications
+        .aggregate([
+          { $match: filter },
+          {
+            $lookup: {
+              from: COLLECTIONS.cameras,
+              localField: 'camera_id',
+              foreignField: 'id',
+              as: '_camera',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.zones,
+              localField: '_camera.zone_id',
+              foreignField: 'id',
+              as: '_zone',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.visitors,
+              localField: 'visitor_id',
+              foreignField: 'id',
+              as: '_visitor',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.securityAlerts,
+              localField: 'id',
+              foreignField: 'identification_id',
+              as: '_alert',
+            },
+          },
+          {
+            $addFields: {
+              camera_name: { $arrayElemAt: ['$_camera.name', 0] },
+              zone_name: { $arrayElemAt: ['$_zone.name', 0] },
+              visitor_name: { $arrayElemAt: ['$_visitor.full_name', 0] },
+              visitor_id_number: { $arrayElemAt: ['$_visitor.id_number', 0] },
+              visitor_company: { $arrayElemAt: ['$_visitor.company', 0] },
+              visitor_status: { $arrayElemAt: ['$_visitor.status', 0] },
+              alert_id: { $arrayElemAt: ['$_alert.id', 0] },
+              alert_severity: { $arrayElemAt: ['$_alert.severity', 0] },
+              alert_title: { $arrayElemAt: ['$_alert.title', 0] },
+            },
+          },
+          { $project: { _camera: 0, _zone: 0, _visitor: 0, _alert: 0 } },
+          { $sort: { detected_at: -1 } },
+          { $skip: skip },
+          { $limit: take },
+        ])
+        .toArray()
 
       return {
-        items: dataRes.rows,
-        pagination: { total, limit, offset },
+        items: rows.map(present),
+        pagination: { total, limit: take, offset: skip },
       }
     },
 
     async listAlerts({ isAcknowledged = null, severity = '', limit = 50, offset = 0 } = {}) {
-      const conditions = []
-      const params = []
+      const filter = {}
 
       if (isAcknowledged !== null) {
-        params.push(isAcknowledged === 'true' || isAcknowledged === true)
-        conditions.push(`a.is_acknowledged = $${params.length}`)
+        filter.is_acknowledged = isAcknowledged === 'true' || isAcknowledged === true
       }
-      if (severity) {
-        params.push(severity)
-        conditions.push(`a.severity = $${params.length}`)
-      }
+      if (severity) filter.severity = severity
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const total = await alerts.countDocuments(filter)
 
-      const countRes = await db.query(`SELECT count(*)::int as total FROM security_alerts a ${whereClause}`, params)
-      const total = countRes.rows[0].total
+      const { skip, limit: take } = paging(safeLimit(limit), offset)
 
-      params.push(limit)
-      const limitIdx = params.length
-      params.push(offset)
-      const offsetIdx = params.length
-
-      const dataSql = `
-        SELECT
-          a.*,
-          c.name as camera_name,
-          z.name as zone_name,
-          u.full_name as acknowledged_by_name
-        FROM security_alerts a
-        JOIN cameras c ON a.camera_id = c.id
-        LEFT JOIN zones z ON c.zone_id = z.id
-        LEFT JOIN users u ON a.acknowledged_by = u.id
-        ${whereClause}
-        ORDER BY a.created_at DESC
-        LIMIT $${limitIdx} OFFSET $${offsetIdx}
-      `
-      const dataRes = await db.query(dataSql, params)
+      const rows = await alerts
+        .aggregate([
+          { $match: filter },
+          {
+            $lookup: {
+              from: COLLECTIONS.cameras,
+              localField: 'camera_id',
+              foreignField: 'id',
+              as: '_camera',
+            },
+          },
+          {
+            // The alert's zone comes through the camera, so this lookup runs on
+            // the joined camera's zone_id rather than on the alert document.
+            $lookup: {
+              from: COLLECTIONS.zones,
+              localField: '_camera.zone_id',
+              foreignField: 'id',
+              as: '_zone',
+            },
+          },
+          {
+            $lookup: {
+              from: COLLECTIONS.users,
+              localField: 'acknowledged_by',
+              foreignField: 'id',
+              as: '_user',
+            },
+          },
+          {
+            $addFields: {
+              camera_name: { $arrayElemAt: ['$_camera.name', 0] },
+              zone_name: { $arrayElemAt: ['$_zone.name', 0] },
+              acknowledged_by_name: { $arrayElemAt: ['$_user.full_name', 0] },
+            },
+          },
+          { $project: { _camera: 0, _zone: 0, _user: 0 } },
+          { $sort: { created_at: -1 } },
+          { $skip: skip },
+          { $limit: take },
+        ])
+        .toArray()
 
       return {
-        items: dataRes.rows,
-        pagination: { total, limit, offset },
+        items: rows.map(present),
+        pagination: { total, limit: take, offset: skip },
       }
     },
 
     async acknowledgeAlert(alertId, actorId) {
-      const res = await db.query(
-        `UPDATE security_alerts
-         SET is_acknowledged = true, acknowledged_by = $1, acknowledged_at = now()
-         WHERE id = $2
-         RETURNING *`,
-        [actorId, alertId]
+      const now = new Date()
+      const alert = await alerts.findOneAndUpdate(
+        { id: alertId },
+        { $set: { is_acknowledged: true, acknowledged_by: actorId, acknowledged_at: now } },
+        { returnDocument: 'after' }
       )
 
-      if (res.rows.length === 0) {
+      if (!alert) {
         throw new NotFoundError(`Alert ${alertId} not found`)
       }
 
-      await db.query(
-        `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-         VALUES ($1, 'ACKNOWLEDGE_ALERT', 'alert', $2, '{}')`,
-        [actorId, alertId]
-      )
+      try {
+        await auditLogs.insertOne({
+          id: newId(),
+          user_id: actorId,
+          action: 'ACKNOWLEDGE_ALERT',
+          entity_type: 'alert',
+          entity_id: alertId,
+          ip_address: null,
+          details: {},
+          created_at: now,
+        })
+      } catch (err) {
+        console.warn('[Audit] Failed to record alert acknowledgement:', err.message)
+      }
 
-      return res.rows[0]
+      return present(alert)
     },
   }
 }

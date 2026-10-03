@@ -1,14 +1,35 @@
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { BadRequestError, UnauthorizedError, ConflictError, NotFoundError } from '../../shared/errors.js'
+import { COLLECTIONS, newId, containsFilter, present } from '../../shared/mongo/helpers.js'
 
-const USER_PROFILE_COLUMNS = `
-  id, username, email, role, full_name, status,
-  department, badge_number, clearance_level, mfa_enabled, last_login_at,
-  created_at, updated_at
-`
+/**
+ * Profile fields returned to the console.
+ *
+ * Replaces the `USER_PROFILE_COLUMNS` SELECT list. `password_hash` is excluded
+ * so a bug can never leak it through a profile endpoint.
+ */
+const PROFILE_PROJECTION = {
+  _id: 0,
+  id: 1,
+  username: 1,
+  email: 1,
+  role: 1,
+  full_name: 1,
+  status: 1,
+  department: 1,
+  badge_number: 1,
+  clearance_level: 1,
+  mfa_enabled: 1,
+  last_login_at: 1,
+  created_at: 1,
+  updated_at: 1,
+}
 
 export function makeAuthService({ db, config }) {
+  const users = db.collection(COLLECTIONS.users)
+  const auditLogs = db.collection(COLLECTIONS.auditLogs)
+
   return {
     async register({ username, email, password, role = 'guard', fullName, department = '', badgeNumber = null, clearanceLevel = 'STANDARD' }) {
       if (!username || !email || !password || !fullName) {
@@ -25,58 +46,69 @@ export function makeAuthService({ db, config }) {
         throw new BadRequestError(`Invalid clearanceLevel. Valid levels are: ${validClearance.join(', ')}`)
       }
 
-      // Check if username or email already exists
-      const existing = await db.query(
-        'SELECT id, username, email FROM users WHERE username = $1 OR email = $2',
-        [username.toLowerCase().trim(), email.toLowerCase().trim()]
+      const normalisedUsername = username.toLowerCase().trim()
+      const normalisedEmail = email.toLowerCase().trim()
+
+      // Pre-check for a friendly message. The unique indexes are the real
+      // guarantee: two concurrent registrations can both pass this check, and
+      // only the index makes the second one fail.
+      const existing = await users.findOne(
+        { $or: [{ username: normalisedUsername }, { email: normalisedEmail }] },
+        { projection: { _id: 0, id: 1, username: 1, email: 1 } }
       )
-      if (existing.rows.length > 0) {
+      if (existing) {
         throw new ConflictError('A user with this username or email already exists')
       }
 
-      const saltRounds = 10
-      const passwordHash = await bcrypt.hash(password, saltRounds)
+      const now = new Date()
+      const doc = {
+        id: newId(),
+        username: normalisedUsername,
+        email: normalisedEmail,
+        password_hash: await bcrypt.hash(password, 10),
+        role,
+        full_name: fullName.trim(),
+        status: 'active',
+        department: department.trim(),
+        badge_number: badgeNumber ? badgeNumber.trim() : null,
+        clearance_level: clearanceLevel,
+        mfa_enabled: true,
+        last_login_at: null,
+        created_at: now,
+        updated_at: now,
+      }
 
-      const result = await db.query(
-        `INSERT INTO users (username, email, password_hash, role, full_name, department, badge_number, clearance_level)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING ${USER_PROFILE_COLUMNS}`,
-        [
-          username.toLowerCase().trim(),
-          email.toLowerCase().trim(),
-          passwordHash,
-          role,
-          fullName.trim(),
-          department.trim(),
-          badgeNumber ? badgeNumber.trim() : null,
-          clearanceLevel,
-        ]
-      )
+      try {
+        await users.insertOne(doc)
+      } catch (err) {
+        // Duplicate key (11000) is the unique index rejecting a race.
+        if (err.code === 11000) {
+          throw new ConflictError('A user with this username or email already exists')
+        }
+        throw err
+      }
 
-      await this.recordAudit(result.rows[0].id, 'CREATE_USER', result.rows[0].id, {
-        username: result.rows[0].username,
+      await this.recordAudit(doc.id, 'CREATE_USER', doc.id, {
+        username: doc.username,
         role,
         clearanceLevel,
       })
 
-      return result.rows[0]
+      // Never return the hash.
+      return present({ ...doc, password_hash: undefined })
     },
-
-    async login({ username, password }) {
+async login({ username, password }) {
       if (!username || !password) {
         throw new BadRequestError('Username and password are required')
       }
 
-      const result = await db.query(
-        `SELECT ${USER_PROFILE_COLUMNS}, password_hash FROM users WHERE username = $1 OR email = $1`,
-        [username.toLowerCase().trim()]
-      )
+      const normalised = username.toLowerCase().trim()
+      const user = await users.findOne({ $or: [{ username: normalised }, { email: normalised }] })
 
-      if (result.rows.length === 0) {
+      if (!user) {
         throw new UnauthorizedError('Invalid username or password')
       }
 
-      const user = result.rows[0]
       if (user.status !== 'active') {
         throw new UnauthorizedError(`Account is ${user.status}. Please contact an administrator.`)
       }
@@ -98,10 +130,8 @@ export function makeAuthService({ db, config }) {
       )
 
       // Record successful authentication for the console's "last login" display.
-      await db.query(
-        'UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = $1',
-        [user.id]
-      )
+      const now = new Date()
+      await users.updateOne({ id: user.id }, { $set: { last_login_at: now, updated_at: now } })
 
       return {
         token,
@@ -116,18 +146,17 @@ export function makeAuthService({ db, config }) {
           badgeNumber: user.badge_number,
           clearanceLevel: user.clearance_level,
           mfaVerified: user.mfa_enabled,
-          lastLoginAt: user.last_login_at || new Date().toISOString(),
+          lastLoginAt: now.toISOString(),
         },
       }
     },
 
     async getMe(userId) {
-      const result = await db.query(`SELECT ${USER_PROFILE_COLUMNS} FROM users WHERE id = $1`, [userId])
-
-      if (result.rows.length === 0) {
+      const user = await users.findOne({ id: userId }, { projection: PROFILE_PROJECTION })
+      if (!user) {
         throw new NotFoundError('User not found')
       }
-      return result.rows[0]
+      return present(user)
     },
 
     /**
@@ -135,39 +164,34 @@ export function makeAuthService({ db, config }) {
      * Supports optional filtering by role and free-text search.
      */
     async listUsers({ role = '', q = '' } = {}) {
-      const conditions = []
-      const params = []
+      const filter = {}
 
-      if (role) {
-        params.push(role)
-        conditions.push(`role = $${params.length}`)
-      }
+      if (role) filter.role = role
 
-      if (q) {
-        params.push(`%${q}%`)
-        conditions.push(`(username ILIKE $${params.length} OR full_name ILIKE $${params.length} OR email ILIKE $${params.length})`)
-      }
+      // `ILIKE '%term%'` across three columns -> an escaped, case-insensitive
+      // `$or` of regexes (see `containsFilter`).
+      if (q) Object.assign(filter, containsFilter(q, ['username', 'full_name', 'email']))
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const rows = await users
+        .find(filter, { projection: PROFILE_PROJECTION })
+        .sort({ role: 1, full_name: 1 })
+        .toArray()
 
-      const result = await db.query(
-        `SELECT ${USER_PROFILE_COLUMNS}
-         FROM users
-         ${whereClause}
-         ORDER BY role ASC, full_name ASC`,
-        params
-      )
-
-      return result.rows
+      return rows.map(present)
     },
 
     async recordAudit(userId, action, entityId, details) {
       try {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [userId, action, 'user', entityId, JSON.stringify(details || {})]
-        )
+        await auditLogs.insertOne({
+          id: newId(),
+          user_id: userId,
+          action,
+          entity_type: 'user',
+          entity_id: entityId,
+          ip_address: null,
+          details: details || {},
+          created_at: new Date(),
+        })
       } catch (err) {
         // Auditing must never block the primary operation.
         console.warn('[Audit] Failed to record user audit event:', err.message)

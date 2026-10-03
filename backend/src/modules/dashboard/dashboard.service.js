@@ -1,42 +1,83 @@
+import { COLLECTIONS } from '../../shared/mongo/helpers.js'
+
 /**
  * Aggregated operational counters for the Security Operations Console landing page.
- * Resolved in a single round-trip so the dashboard does not fan out into N queries
- * on every poll.
+ *
+ * The PostgreSQL version resolved all of these in a single round-trip using a
+ * query with twelve correlated subqueries. MongoDB has no equivalent construct,
+ * so the counters are issued concurrently with `Promise.all` - they overlap on
+ * the wire rather than fanning out sequentially, which keeps the wall-clock cost
+ * close to one round-trip while each count uses a proper index.
  */
 export function makeDashboardService({ db }) {
+  const visits = db.collection(COLLECTIONS.visits)
+  const visitors = db.collection(COLLECTIONS.visitors)
+  const cameras = db.collection(COLLECTIONS.cameras)
+  const zones = db.collection(COLLECTIONS.zones)
+  const alerts = db.collection(COLLECTIONS.securityAlerts)
+  const identifications = db.collection(COLLECTIONS.identifications)
+  const auditLogs = db.collection(COLLECTIONS.auditLogs)
+
+  // `now()::date` truncated to midnight, matching Postgres date semantics for
+  // the "expected today" window.
+  const startOfToday = () => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  };
+
+  const daysAgo = (n) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+
   return {
     async getSummary() {
-      const result = await db.query(`
-        SELECT
-          -- Visitor / pass occupancy
-          (SELECT count(*)::int FROM visits WHERE on_site = true)                          AS visitors_on_site,
-          (SELECT count(*)::int FROM visits
-             WHERE status = 'scheduled'
-               AND expected_arrival::date = now()::date)                                  AS expected_today,
-          (SELECT count(*)::int FROM visits WHERE status = 'checked_in')                   AS checked_in_total,
-          (SELECT count(*)::int FROM visitors)                                             AS visitors_total,
-          (SELECT count(*)::int FROM visitors WHERE status = 'blacklisted')                AS visitors_blacklisted,
-          (SELECT count(*)::int FROM visitors WHERE status = 'flagged')                    AS visitors_flagged,
+      const [
+        visitorsOnSite,
+        expectedToday,
+        checkedInTotal,
+        visitorsTotal,
+        visitorsBlacklisted,
+        visitorsFlagged,
+        camerasTotal,
+        camerasOnline,
+        camerasOffline,
+        zonesTotal,
+        alertsActive,
+        alertsCritical,
+        detections24h,
+        auditEvents24h,
+      ] = await Promise.all([
+        visits.countDocuments({ on_site: true }),
+        visits.countDocuments({ status: 'scheduled', expected_arrival: { $gte: startOfToday() } }),
+        visits.countDocuments({ status: 'checked_in' }),
+        visitors.countDocuments({}),
+        visitors.countDocuments({ status: 'blacklisted' }),
+        visitors.countDocuments({ status: 'flagged' }),
+        cameras.countDocuments({}),
+        cameras.countDocuments({ status: 'online' }),
+        cameras.countDocuments({ status: 'offline' }),
+        zones.countDocuments({}),
+        alerts.countDocuments({ is_acknowledged: false }),
+        alerts.countDocuments({ is_acknowledged: false, severity: 'critical' }),
+        identifications.countDocuments({ detected_at: { $gte: daysAgo(1) } }),
+        auditLogs.countDocuments({ created_at: { $gte: daysAgo(1) } }),
+      ]);
 
-          -- CCTV fleet availability
-          (SELECT count(*)::int FROM cameras)                                              AS cameras_total,
-          (SELECT count(*)::int FROM cameras WHERE status = 'online')                      AS cameras_online,
-          (SELECT count(*)::int FROM cameras WHERE status = 'offline')                     AS cameras_offline,
-          (SELECT count(*)::int FROM zones)                                                AS zones_total,
-
-          -- Security posture
-          (SELECT count(*)::int FROM security_alerts WHERE is_acknowledged = false)        AS alerts_active,
-          (SELECT count(*)::int FROM security_alerts
-             WHERE is_acknowledged = false AND severity = 'critical')                      AS alerts_critical,
-          (SELECT count(*)::int FROM identifications
-             WHERE detected_at > now() - interval '24 hours')                              AS detections_24h,
-
-          -- Compliance
-          (SELECT count(*)::int FROM audit_logs
-             WHERE created_at > now() - interval '24 hours')                               AS audit_events_24h
-      `)
-
-      return result.rows[0]
+      return {
+        visitors_on_site: visitorsOnSite,
+        expected_today: expectedToday,
+        checked_in_total: checkedInTotal,
+        visitors_total: visitorsTotal,
+        visitors_blacklisted: visitorsBlacklisted,
+        visitors_flagged: visitorsFlagged,
+        cameras_total: camerasTotal,
+        cameras_online: camerasOnline,
+        cameras_offline: camerasOffline,
+        zones_total: zonesTotal,
+        alerts_active: alertsActive,
+        alerts_critical: alertsCritical,
+        detections_24h: detections24h,
+        audit_events_24h: auditEvents24h,
+      };
     },
   }
 }

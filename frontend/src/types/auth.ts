@@ -7,7 +7,8 @@ export type UserRole =
   | 'auditor';
 
 /**
- * Role codes persisted in the `users.role` column (Neon Postgres CHECK constraint).
+ * Role codes persisted in the `users.role` field (enforced by the MongoDB
+ * `$jsonSchema` enum in migration 0001).
  * The console's RBAC matrix is keyed on `UserRole`, so every database role is
  * projected onto exactly one console role via `toConsoleRole`.
  */

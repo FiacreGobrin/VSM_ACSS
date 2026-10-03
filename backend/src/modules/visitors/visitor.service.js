@@ -1,6 +1,43 @@
-import { BadRequestError, NotFoundError } from '../../shared/errors.js'
+import { BadRequestError, NotFoundError, ConflictError } from '../../shared/errors.js'
+import {
+  COLLECTIONS,
+  newId,
+  containsFilter,
+  paging,
+  safeLimit,
+  present,
+} from '../../shared/mongo/helpers.js'
 
+/**
+ * Visitor registry.
+ *
+ * Stores documents with the same snake_case field names as the former
+ * `visitors` table, so the API's JSON response is unchanged and the console
+ * needs no adjustment.
+ */
 export function makeVisitorService({ db }) {
+  const visitors = db.collection(COLLECTIONS.visitors)
+  const auditLogs = db.collection(COLLECTIONS.auditLogs)
+
+  /** Writes an audit entry. Never throws - auditing must not block the action. */
+  const audit = async (actorId, action, entityId, details) => {
+    if (!actorId) return
+    try {
+      await auditLogs.insertOne({
+        id: newId(),
+        user_id: actorId,
+        action,
+        entity_type: 'visitor',
+        entity_id: entityId,
+        ip_address: null,
+        details,
+        created_at: new Date(),
+      })
+    } catch (err) {
+      console.warn('[Audit] Failed to record visitor audit event:', err.message)
+    }
+  }
+
   return {
     async createVisitor(data, actorId = null) {
       const {
@@ -24,124 +61,93 @@ export function makeVisitorService({ db }) {
         throw new BadRequestError(`Invalid idType. Valid types are: ${validIdTypes.join(', ')}`)
       }
 
-      const result = await db.query(
-        `INSERT INTO visitors (
-          full_name, id_type, id_number, company, email, phone, photo_url, face_feature_vector, notes
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING *`,
-        [
-          fullName.trim(),
-          idType,
-          idNumber.trim(),
-          company.trim(),
-          email ? email.trim() : null,
-          phone ? phone.trim() : null,
-          photoUrl,
-          faceFeatureVector ? JSON.stringify(faceFeatureVector) : null,
-          notes,
-        ]
-      )
-
-      const visitor = result.rows[0]
-
-      // Audit log entry
-      if (actorId) {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, 'CREATE_VISITOR', 'visitor', $2, $3)`,
-          [actorId, visitor.id, JSON.stringify({ fullName, idNumber, idType })]
-        )
+      const now = new Date()
+      const doc = {
+        id: newId(),
+        full_name: fullName.trim(),
+        id_type: idType,
+        id_number: idNumber.trim(),
+        company: company.trim(),
+        email: email ? email.trim() : null,
+        phone: phone ? phone.trim() : null,
+        photo_url: photoUrl,
+        // Stored natively as an array; the old JSONB column round-tripped
+        // through JSON.stringify, so a plain array is the closer analogue.
+        face_feature_vector: faceFeatureVector || null,
+        status: 'active',
+        notes,
+        created_at: now,
+        updated_at: now,
       }
 
-      return visitor
+      try {
+        await visitors.insertOne(doc)
+      } catch (err) {
+        // UNIQUE (id_type, id_number) -> unique index rejection.
+        if (err.code === 11000) {
+          throw new ConflictError(
+            `A visitor with this ${idType} / ${idNumber.trim()} already exists`
+          )
+        }
+        throw err
+      }
+
+      await audit(actorId, 'CREATE_VISITOR', doc.id, { fullName, idNumber, idType })
+
+      return present(doc)
     },
 
     async listVisitors({ query = '', status = '', limit = 50, offset = 0 } = {}) {
-      const conditions = []
-      const params = []
+      const filter = {}
 
-      if (status) {
-        params.push(status)
-        conditions.push(`status = $${params.length}`)
-      }
+      if (status) filter.status = status
 
-      if (query) {
-        params.push(`%${query}%`)
-        conditions.push(`(full_name ILIKE $${params.length} OR id_number ILIKE $${params.length} OR company ILIKE $${params.length})`)
-      }
+      // `full_name ILIKE ... OR id_number ILIKE ... OR company ILIKE ...`
+      if (query) Object.assign(filter, containsFilter(query, ['full_name', 'id_number', 'company']))
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const total = await visitors.countDocuments(filter)
 
-      const countSql = `SELECT count(*)::int as total FROM visitors ${whereClause}`
-      const totalRes = await db.query(countSql, params)
-      const total = totalRes.rows[0].total
-
-      params.push(limit)
-      const limitParamIndex = params.length
-      params.push(offset)
-      const offsetParamIndex = params.length
-
-      const dataSql = `
-        SELECT id, full_name, id_type, id_number, company, email, phone, photo_url, status, notes, created_at, updated_at
-        FROM visitors
-        ${whereClause}
-        ORDER BY created_at DESC
-        LIMIT $${limitParamIndex} OFFSET $${offsetParamIndex}
-      `
-      const dataRes = await db.query(dataSql, params)
+      const { skip, limit: take } = paging(safeLimit(limit), offset)
+      const rows = await visitors
+        .find(filter)
+        .sort({ created_at: -1 })
+        .skip(skip)
+        .limit(take)
+        .toArray()
 
       return {
-        items: dataRes.rows,
-        pagination: {
-          total,
-          limit,
-          offset,
-        },
+        items: rows.map(present),
+        pagination: { total, limit: take, offset: skip },
       }
     },
 
     async getVisitorById(id) {
-      const result = await db.query(
-        `SELECT id, full_name, id_type, id_number, company, email, phone, photo_url, face_feature_vector, status, notes, created_at, updated_at
-         FROM visitors
-         WHERE id = $1`,
-        [id]
-      )
-
-      if (result.rows.length === 0) {
+      const visitor = await visitors.findOne({ id })
+      if (!visitor) {
         throw new NotFoundError(`Visitor with ID ${id} not found`)
       }
-
-      return result.rows[0]
+      return present(visitor)
     },
 
     async updateVisitor(id, data, actorId = null) {
       const visitor = await this.getVisitorById(id)
 
-      const fullName = data.fullName !== undefined ? data.fullName.trim() : visitor.full_name
-      const company = data.company !== undefined ? data.company.trim() : visitor.company
-      const email = data.email !== undefined ? data.email : visitor.email
-      const phone = data.phone !== undefined ? data.phone : visitor.phone
-      const photoUrl = data.photoUrl !== undefined ? data.photoUrl : visitor.photo_url
-      const notes = data.notes !== undefined ? data.notes : visitor.notes
+      // Mirrors the Postgres UPDATE: only fields present in the payload change.
+      const updates = {}
+      if (data.fullName !== undefined) updates.full_name = data.fullName.trim()
+      if (data.company !== undefined) updates.company = data.company.trim()
+      if (data.email !== undefined) updates.email = data.email
+      if (data.phone !== undefined) updates.phone = data.phone
+      if (data.photoUrl !== undefined) updates.photo_url = data.photoUrl
+      if (data.notes !== undefined) updates.notes = data.notes
 
-      const result = await db.query(
-        `UPDATE visitors
-         SET full_name = $1, company = $2, email = $3, phone = $4, photo_url = $5, notes = $6, updated_at = now()
-         WHERE id = $7
-         RETURNING *`,
-        [fullName, company, email, phone, photoUrl, notes, id]
-      )
+      updates.updated_at = new Date()
 
-      if (actorId) {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, 'UPDATE_VISITOR', 'visitor', $2, $3)`,
-          [actorId, id, JSON.stringify(data)]
-        )
-      }
+      await visitors.updateOne({ id }, { $set: updates })
 
-      return result.rows[0]
+      await audit(actorId, 'UPDATE_VISITOR', id, data)
+
+      return present({ ...visitor, ...updates })
     },
 
     async updateStatus(id, status, notes = '', actorId = null) {
@@ -150,25 +156,17 @@ export function makeVisitorService({ db }) {
         throw new BadRequestError(`Invalid status. Must be one of: ${validStatuses.join(', ')}`)
       }
 
-      await this.getVisitorById(id)
+      const visitor = await this.getVisitorById(id)
 
-      const result = await db.query(
-        `UPDATE visitors
-         SET status = $1, notes = CASE WHEN $2 <> '' THEN $2 ELSE notes END, updated_at = now()
-         WHERE id = $3
-         RETURNING *`,
-        [status, notes, id]
-      )
+      // `notes = CASE WHEN $2 <> '' THEN $2 ELSE notes END` -> a conditional $set.
+      const updates = { status, updated_at: new Date() }
+      if (notes) updates.notes = notes
 
-      if (actorId) {
-        await db.query(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details)
-           VALUES ($1, 'VISITOR_STATUS_CHANGE', 'visitor', $2, $3)`,
-          [actorId, id, JSON.stringify({ newStatus: status, notes })]
-        )
-      }
+      await visitors.updateOne({ id }, { $set: updates })
 
-      return result.rows[0]
+      await audit(actorId, 'VISITOR_STATUS_CHANGE', id, { newStatus: status, notes })
+
+      return present({ ...visitor, ...updates })
     },
   }
 }

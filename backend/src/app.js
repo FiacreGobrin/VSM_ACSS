@@ -16,8 +16,8 @@ export function makeApp({ logger, modules, config }) {
   app.get('/', (req, res) => {
     sendSuccess(res, {
       name: 'Visitor Management & CCTV Camera Identification API',
-      version: '1.0.0',
-      database: config.isNeon ? 'Neon Serverless Postgres' : 'PostgreSQL',
+      version: '1.1.0',
+      database: config.mongo.isAtlas ? 'MongoDB Atlas' : 'MongoDB',
       endpoints: {
         health: '/health',
         auth: '/api/v1/auth',

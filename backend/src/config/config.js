@@ -15,6 +15,40 @@ function parsePositiveInt(raw, fallback) {
   return parsed
 }
 
+/**
+ * Validates a MongoDB connection string's authority component.
+ *
+ * The driver defers URI parsing until the first connection attempt, so a typo
+ * surfaces as an opaque timeout minutes later. Checking the host portion here
+ * turns that into an immediate, actionable boot failure instead.
+ */
+function assertMongoUriShape(uri) {
+  if (!uri.startsWith('mongodb://') && !uri.startsWith('mongodb+srv://')) {
+    throw new Error(
+      'MONGODB_URI must start with mongodb:// or mongodb+srv://. Examples:\n' +
+        '  mongodb://[user]:[password]@localhost:27017/vms_acs\n' +
+        '  mongodb+srv://[user]:[password]@cluster0.example.net/vms_acs\n' +
+        'Note: credentials containing "@" must be URL-encoded as %40.'
+    )
+  }
+
+  // `mongodb+srv` takes only a bare hostname, so there is nothing to validate
+  // beyond the scheme - the DNS lookup at connect time is the real test.
+  if (uri.startsWith('mongodb+srv://')) return
+
+  try {
+    const authority = uri.replace(/^mongodb:\/\//, '').split('/')[0]
+    // eslint-disable-next-line no-new
+    new URL(`http://${authority}`)
+  } catch {
+    throw new Error(
+      'MONGODB_URI is not a valid connection string. Expected:\n' +
+        '  mongodb://[user]:[password]@host:27017/[dbname]\n' +
+        'Note: a username containing "@" (e.g. an email address) must be URL-encoded as %40.'
+    )
+  }
+}
+
 export function loadConfig(envFile) {
   if (envFile !== false) {
     loadDotEnv(typeof envFile === 'string' ? envFile : undefined)
@@ -28,89 +62,69 @@ export function loadConfig(envFile) {
     throw new Error(`Invalid PORT configuration: "${rawPort}"`)
   }
 
-  const databaseUrl =
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_URL ||
-    process.env.VMS_DATABASE_URL ||
-    ''
-
   const jwtSecret = process.env.JWT_SECRET || 'dev_secret_key_visitor_cctv_system'
   const jwtExpiresIn = process.env.JWT_EXPIRES_IN || '7d'
   const corsOrigin = process.env.CORS_ORIGIN || '*'
 
-  // Neon & PostgreSQL pool tuning
-  const poolMax = parseInt(process.env.DB_POOL_MAX || '20', 10)
-  const connectionTimeoutMs = parseInt(process.env.DB_TIMEOUT_MS || '10000', 10)
-  const idleTimeoutMs = parseInt(process.env.DB_IDLE_TIMEOUT_MS || '30000', 10)
+  /* ---------------------------- MongoDB connection ---------------------- */
+  // Both schemes are supported: an air-gapped appliance runs its own mongod
+  // (`mongodb://`), while a hosted deployment uses Atlas (`mongodb+srv://`).
+  const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URL || ''
 
-  // Neon requires SSL. If URL contains neon.tech or sslmode=require, enable SSL
-  const isNeon = databaseUrl.includes('neon.tech')
-  const requiresSsl = isNeon || databaseUrl.includes('sslmode=require')
+  // A `mongodb+srv://` URI carries the database in its path, but a bare
+  // `mongodb://host:27017` does not, so an explicit name is always required.
+  const mongoDbName = process.env.MONGODB_DB || 'vms_acs'
 
-  /* ------------------------------------------------------------------ */
-  /* Media / evidence upload storage                                    */
-  /* ------------------------------------------------------------------ */
-  // Uploaded CCTV clips are written to the API host's filesystem. The console
-  // is air-gapped, so an object-store SDK would add a dependency that cannot
-  // reach the internet; a mounted volume behind `UPLOAD_DIR` is the correct
-  // shape here. Swap `localDiskStorage` for an S3-compatible adapter if the
-  // appliance is later given a sanctioned egress path.
+  const isAtlas = mongoUri.includes('mongodb+srv://')
 
-  // Resolved against the process CWD (the `backend/` directory) so the default
-  // keeps every artefact inside the repo rather than scattering files on the C drive.
+  // Multi-document transactions require a replica set. Atlas free tier (M0)
+  // does not provide one, so callers must degrade rather than assume.
+  const supportsTransactions = isAtlas || mongoUri.includes('replicaSet=')
+
+  if (mongoUri) assertMongoUriShape(mongoUri)
+
+  // A warm `minPoolSize` keeps a connection ready so the SOC health poll does
+  // not pay a TCP + TLS handshake every 30 seconds.
+  const poolMax = parsePositiveInt(process.env.MONGO_POOL_MAX, 20)
+  const minPool = parsePositiveInt(process.env.MONGO_MIN_POOL, 2)
+  const timeoutMs = parsePositiveInt(process.env.MONGO_TIMEOUT_MS, 10000)
+
+  /* ---------------------- Media / evidence upload storage --------------- */
+  // Clips are written to the API host's filesystem: the console is air-gapped,
+  // so an object-store SDK would add a dependency that cannot reach the internet.
+  // Resolved against the process CWD (`backend/`) to keep artefacts in the repo.
   const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || 'uploads')
 
-  const uploadMaxVideoBytes = parsePositiveInt(process.env.UPLOAD_MAX_VIDEO_BYTES, 500 * 1024 * 1024)
+  const uploadMaxVideoBytes = parsePositiveInt(
+    process.env.UPLOAD_MAX_VIDEO_BYTES,
+    500 * 1024 * 1024
+  )
   const uploadMaxImageBytes = parsePositiveInt(process.env.UPLOAD_MAX_IMAGE_BYTES, 15 * 1024 * 1024)
-  // Cap on how many clips a single multipart request may carry. Bounds operator
-  // memory use, since multer buffers the whole request in RAM before validation.
+  // Bounds operator memory use, since multer buffers the request in RAM first.
   const uploadMaxFiles = parsePositiveInt(process.env.UPLOAD_MAX_FILES, 10)
-
-  // Fail fast on a malformed connection string.
-  // `pg` defers URL parsing to query time and throws a bare
-  // `TypeError: Invalid URL` deep in the driver, which surfaces to the
-  // operator as an unexplained 500. Validating here keeps the cause obvious.
-  if (databaseUrl) {
-    try {
-      // eslint-disable-next-line no-new
-      new URL(databaseUrl)
-    } catch {
-      throw new Error(
-        'DATABASE_URL is not a valid URL. Expected format:\n' +
-          '  postgresql://[user]:[password]@[endpoint].neon.tech/[dbname]?sslmode=require\n' +
-          'Note: a username containing "@" (e.g. an email address) must be URL-encoded as %40.'
-      )
-    }
-  }
 
   return {
     env,
     port,
-    databaseUrl,
-    isNeon,
-    jwt: {
-      secret: jwtSecret,
-      expiresIn: jwtExpiresIn,
-    },
-    cors: {
-      origin: corsOrigin,
+    mongo: { uri: mongoUri, dbName: mongoDbName, isAtlas, supportsTransactions },
+    jwt: { secret: jwtSecret, expiresIn: jwtExpiresIn },
+    cors: { origin: corsOrigin },
+    db: {
+      max: poolMax,
+      min: minPool,
+      serverSelectionTimeoutMS: timeoutMs,
+      connectTimeoutMS: timeoutMs,
+      socketTimeoutMS: timeoutMs * 3,
     },
     uploads: {
       dir: uploadDir,
       maxVideoBytes: uploadMaxVideoBytes,
       maxImageBytes: uploadMaxImageBytes,
       maxFiles: uploadMaxFiles,
-      // Only these container formats are accepted. The registry is re-verified
-      // against the file's magic bytes on upload (see `shared/media/magicBytes.js`),
-      // because a browser-supplied Content-Type is attacker-controlled.
+      // Re-verified against the file's magic bytes on upload, because a
+      // browser-supplied Content-Type is attacker-controlled.
       allowedVideoTypes: ['video/mp4', 'video/webm', 'video/quicktime'],
       allowedImageTypes: ['image/jpeg', 'image/png', 'image/webp'],
-    },
-    db: {
-      max: poolMax,
-      connectionTimeoutMillis: connectionTimeoutMs,
-      idleTimeoutMillis: idleTimeoutMs,
-      ssl: requiresSsl ? { rejectUnauthorized: false } : undefined,
     },
   }
 }

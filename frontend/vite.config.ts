@@ -15,9 +15,9 @@ export default defineConfig({
     port: 3000,
     host: true,
     proxy: {
-      // The console never talks to Neon Postgres directly. These paths are
-      // proxied to the Express gateway, which owns the connection pool and the
-      // DATABASE_URL secret. Using a proxy in development also keeps requests
+      // The console never talks to the database directly. These paths are
+      // proxied to the Express gateway, which owns the MongoDB client and the
+      // MONGODB_URI secret. Using a proxy in development also keeps requests
       // same-origin, so no CORS preflight is needed.
       '/api': {
         target: 'http://localhost:8080',

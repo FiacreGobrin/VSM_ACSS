@@ -1,0 +1,1124 @@
+{
+  "info": {
+    "_postman_id": "b7f3c2a1-9d4e-4c8b-a1f2-5e6d7c8b9a01",
+    "name": "VMS-ACS API (MongoDB)",
+    "description": "Visitor Management, Access Control & CCTV Evidence API.\n\nHOW TO USE\n1. Set the `baseUrl` variable to your running API (default http://localhost:8080).\n2. Run \"Auth > Login (admin)\" FIRST - its test script captures the JWT into `token`.\n3. Every other request sends `Authorization: Bearer {{token}}` via collection-level auth.\n\nResponses use the envelope `{ success, data, meta }` or `{ success:false, error:{ code, message } }`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Error responses use HTTP 4xx with `{ success:false, error:{...} }`, so success",
+          "// must be read from the body rather than assumed from the status code.",
+          "pm.test('Response is JSON', () => { pm.response.to.be.json; });"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "zoneId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "cameraId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "visitorId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "visitId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "recordingId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "alertId",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "01 - Health & Auth",
+      "item": [
+        {
+          "name": "API Index (public)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Lists every mounted endpoint. Public - no token needed.",
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": []
+            }
+          }
+        },
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Uptime plus a live MongoDB round-trip. Use this to prove the database is genuinely reachable, not merely that the process started.",
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Login (admin)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"admin\",\n  \"password\": \"AdminPass123!\"\n}"
+            },
+            "description": "Run this FIRST. Seeded credentials are admin / AdminPass123!.",
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "login"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('Login returns 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Login returns a token', () => {",
+                  "  pm.expect(body.success).to.eql(true);",
+                  "  pm.expect(body.data.token).to.be.a('string').and.not.empty;",
+                  "});",
+                  "if (body.success && body.data && body.data.token) {",
+                  "  pm.collectionVariables.set('token', body.data.token);",
+                  "  console.log('Token captured:', body.data.token.slice(0, 24) + '...');",
+                  "} else {",
+                  "  console.error('Login failed:', JSON.stringify(body));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login (guard - RBAC checks)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"guard_john\",\n  \"password\": \"GuardPass123!\"\n}"
+            },
+            "description": "Logs in as a guard to confirm 403s on privileged routes. Overwrites `token`, so re-run the admin login afterwards.",
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "login"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.token;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('guardToken', String(id));",
+                  "  console.log('guardToken =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Current User (me)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "me"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "admin + auditor only.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/users?role=admin",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "users"
+              ],
+              "query": [
+                {
+                  "key": "role",
+                  "value": "admin"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 - Cameras & Zones",
+      "item": [
+        {
+          "name": "List Security Zones",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/cameras/zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "cameras",
+                "zones"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Security Zone",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Loading Dock\",\n  \"description\": \"Rear goods entrance\",\n  \"securityLevel\": 3\n}"
+            },
+            "description": "admin + operator. Saves zoneId for the requests below.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/cameras/zones",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "cameras",
+                "zones"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.id;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('zoneId', String(id));",
+                  "  console.log('zoneId =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Cameras",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Optional filters: ?zoneId=<uuid> or ?status=online|offline|maintenance.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/cameras",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "cameras"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Register Camera",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Main Gate 01\",\n  \"streamUrl\": \"rtsp://10.10.0.51:554/Streaming/Channels/101\",\n  \"model\": \"Hikvision DS-2CD8A\",\n  \"zoneId\": \"\",\n  \"ipAddress\": \"10.10.0.51\"\n}"
+            },
+            "description": "admin only. Put {{zoneId}} in zoneId to bind it to the zone you created.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/cameras",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "cameras"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.id;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('cameraId', String(id));",
+                  "  console.log('cameraId =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Camera",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/cameras/{{cameraId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "cameras",
+                "{{cameraId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Camera Heartbeat",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "description": "Marks the camera online and stamps last_heartbeat_at.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/cameras/{{cameraId}}/heartbeat",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "cameras",
+                "{{cameraId}}",
+                "heartbeat"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 - Visitors",
+      "item": [
+        {
+          "name": "List Visitors",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Supports ?q= (matches name / ID number / company), ?status=active|blacklisted|flagged, plus limit/offset. Pagination metadata comes back in `meta`.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visitors?status=active&limit=20&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visitors"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "active"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Visitor",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fullName\": \"Sarah Connor\",\n  \"idType\": \"national_id\",\n  \"idNumber\": \"1198580029381014\",\n  \"company\": \"Cyberdyne Systems\",\n  \"email\": \"sarah.connor@example.com\",\n  \"phone\": \"+250788000000\"\n}"
+            },
+            "description": "idType must be one of: national_id | passport | drivers_license | other. (id_type, id_number) is UNIQUE - re-posting the same pair returns 409 conflict.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visitors",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visitors"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.id;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('visitorId', String(id));",
+                  "  console.log('visitorId =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Visitor",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visitors/{{visitorId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visitors",
+                "{{visitorId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update Visitor",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"company\": \"Cyberdyne Systems Ltd\",\n  \"notes\": \"VIP - escorted at all times\"\n}"
+            },
+            "description": "admin + operator. Only the fields you send are changed.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visitors/{{visitorId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visitors",
+                "{{visitorId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Set Visitor Status",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"flagged\",\n  \"notes\": \"Reported by perimeter camera\"\n}"
+            },
+            "description": "status: active | blacklisted | flagged. Setting blacklisted means a recognition event raises a security alert.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visitors/{{visitorId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visitors",
+                "{{visitorId}}",
+                "status"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 - Visits & Access Passes",
+      "item": [
+        {
+          "name": "List Visits",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Supports ?status=scheduled|checked_in|checked_out|cancelled|denied and ?visitorId=.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visits?status=scheduled",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visits"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "scheduled"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Visit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"visitorId\": \"{{visitorId}}\",\n  \"hostName\": \"Dr. James Hall\",\n  \"hostEmail\": \"j.hall@example.com\",\n  \"purpose\": \"Server room inspection\",\n  \"badgeNumber\": \"V-1042\",\n  \"expectedArrival\": \"2026-10-03T16:56:19.979Z\",\n  \"authorizedZones\": []\n}"
+            },
+            "description": "Create the visitor first so {{visitorId}} is populated. Omit authorizedZones to default to the perimeter only.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visits",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visits"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.id;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('visitId', String(id));",
+                  "  console.log('visitId =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Check In",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"badgeNumber\": \"V-1042\"\n}"
+            },
+            "description": "Moves status to checked_in and flips the on_site counter used by the dashboard.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visits/{{visitId}}/check-in",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visits",
+                "{{visitId}}",
+                "check-in"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.id;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('visitId', String(id));",
+                  "  console.log('visitId =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Check Out",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "description": "Moves status to checked_out and clears occupancy.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/visits/{{visitId}}/check-out",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "visits",
+                "{{visitId}}",
+                "check-out"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 - CCTV Evidence Upload",
+      "item": [
+        {
+          "name": "List Recordings",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Filters: ?mediaKind=video|image, ?cameraId=<uuid>. Pagination lands in `meta`.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/recordings?limit=24&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "recordings"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "24"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Upload Recording",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "title",
+                  "value": "Main Gate - tailgating 22:14",
+                  "type": "text"
+                },
+                {
+                  "key": "description",
+                  "value": "Two badges scanned, three persons through",
+                  "type": "text"
+                },
+                {
+                  "key": "cameraId",
+                  "value": "{{cameraId}}",
+                  "type": "text"
+                },
+                {
+                  "key": "retentionDays",
+                  "value": "30",
+                  "type": "text"
+                }
+              ]
+            },
+            "description": "Body tab: set `file` to type **File** (not Text), then pick an .mp4/.webm/.mov/.jpg/.png.\nadmin + operator only - a guard receives 403.\nThe server verifies the file by MAGIC BYTES, so a renamed executable is rejected with 415 `unsupported_media_type` no matter what Content-Type Postman sends.\nSet cameraId to {{cameraId}} to attribute the clip to a registered camera.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/recordings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "recordings"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.id;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('recordingId', String(id));",
+                  "  console.log('recordingId =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Upload Recording (minimal)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "title",
+                  "value": "Perimeter still - intruder",
+                  "type": "text"
+                },
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            },
+            "description": "The minimum viable upload: just `file` plus `title`. Pick a real file for the `file` part in the Body tab.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/recordings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "recordings"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const id = body.data.id;",
+                  "if (id) {",
+                  "  pm.collectionVariables.set('recordingId', String(id));",
+                  "  console.log('recordingId =', id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Recording",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/recordings/{{recordingId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "recordings",
+                "{{recordingId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Stream Recording",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Streams the bytes with HTTP range support, so seeking works. Postman previews media inline.\nFor a specific range, add the header `Range: bytes=0-1023`.\nAppend `?download=1` to force a download instead of inline playback.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/recordings/{{recordingId}}/stream",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "recordings",
+                "{{recordingId}}",
+                "stream"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Download Recording",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/recordings/{{recordingId}}/stream?download=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "recordings",
+                "{{recordingId}}",
+                "stream?download=1"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete Recording",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "description": "admin only. Purges the registry row AND the stored file, and writes an audit entry. Irreversible.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/recordings/{{recordingId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "recordings",
+                "{{recordingId}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "06 - Detection & Alerts",
+      "item": [
+        {
+          "name": "Ingest Detection",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cameraId\": \"{{cameraId}}\",\n  \"eventType\": \"unrecognized_person\",\n  \"confidenceScore\": 0.94,\n  \"notes\": \"Motion detected in restricted zone\"\n}"
+            },
+            "description": "Optional auth, so camera gateways can post directly.\neventType: recognized_visitor | unrecognized_person | unauthorized_zone_breach | blacklisted_person_alert | tailgating.\nThis endpoint is what auto-generates security_alerts rows for blacklisted visitors and zone breaches.",
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/identification/detections",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "identification",
+                "detections"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Detections",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/identification/detections?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "identification",
+                "detections"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Alerts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "severity: low | medium | high | critical.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/identification/alerts?isAcknowledged=false",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "identification",
+                "alerts"
+              ],
+              "query": [
+                {
+                  "key": "isAcknowledged",
+                  "value": "false"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Acknowledge Alert",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "description": "admin + operator + guard. Copy an alert id from \"List Alerts\" into the {{alertId}} variable.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/identification/alerts/{{alertId}}/acknowledge",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "identification",
+                "alerts",
+                "{{alertId}}",
+                "acknowledge"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "07 - Dashboard & Audit",
+      "item": [
+        {
+          "name": "Dashboard Summary",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Single round-trip counters behind the SOC landing page: visitors on-site, camera fleet health, unacknowledged alerts, 24h audit volume.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/dashboard/summary",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "dashboard",
+                "summary"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Audit Log",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Every upload, purge, status change and acknowledgement lands here. Try action=UPLOAD_RECORDING after uploading a clip.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/audit?limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "audit"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
