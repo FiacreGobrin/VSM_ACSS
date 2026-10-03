@@ -1,0 +1,133 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 47% 11%;
+    --foreground: 210 40% 98%;
+
+    --card: 222 47% 13%;
+    --card-foreground: 210 40% 98%;
+    --card-border: 217 33% 20%;
+
+    --popover: 222 47% 13%;
+    --popover-foreground: 210 40% 98%;
+
+    --panel: 223 47% 10%;
+    --panel-header: 222 47% 14%;
+    --panel-subtle: 222 47% 16%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 11%;
+
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 217 33% 22%;
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 217 33% 20%;
+    --input: 217 33% 20%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.5rem;
+  }
+
+  .light {
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --card-border: 214 32% 91%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --panel: 210 40% 96%;
+    --panel-header: 210 40% 93%;
+    --panel-subtle: 210 40% 90%;
+
+    --primary: 217 91% 55%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 210 40% 90%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 210 40% 92%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 210 40% 88%;
+    --accent-foreground: 222 47% 11%;
+
+    --destructive: 0 84% 55%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 214 32% 85%;
+    --input: 214 32% 85%;
+    --ring: 217 91% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    overflow-x: hidden;
+  }
+}
+
+/* Custom Scrollbars for dense air-gapped terminal views */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: hsl(var(--background));
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted));
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--primary) / 0.5);
+}
+
+/* Subtle Tactical Grid Pattern */
+.bg-grid-tactical {
+  background-size: 32px 32px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+}
+
+/* Scanline / CRT effect for CCTV / Kiosk */
+.scanlines {
+  background: linear-gradient(
+    rgba(18, 16, 16, 0) 50%, 
+    rgba(0, 0, 0, 0.25) 50%
+  ), linear-gradient(
+    90deg,
+    rgba(255, 0, 0, 0.03),
+    rgba(0, 255, 0, 0.01),
+    rgba(0, 0, 255, 0.03)
+  );
+  background-size: 100% 3px, 4px 100%;
+  pointer-events: none;
+}
+
+/* High contrast outline for keyboard navigation */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}

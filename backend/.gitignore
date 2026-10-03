@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+*.log
+npm-debug.log*
+.DS_Store
+coverage/
+
+# Uploaded CCTV evidence. Binaries must never enter version control: they are
+# operator-supplied, potentially enormous, and regenerable by re-upload.
+uploads/
